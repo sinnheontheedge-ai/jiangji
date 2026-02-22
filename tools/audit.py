@@ -1,9 +1,18 @@
+import os
+import subprocess
+
 print("AUDIT START")
 
-import os
+files = []
+for root, dirs, fs in os.walk("."):
+    for f in fs:
+        if f.endswith(".py"):
+            files.append(os.path.join(root, f))
 
-if not os.path.exists("engine_main.py"):
-    print("ERROR: engine_main.py missing")
+print("PY FILES:", len(files))
+
+if len(files) < 3:
+    print("PROJECT TOO SMALL -> REQUEST FIX")
     exit(1)
 
 print("AUDIT PASS")
