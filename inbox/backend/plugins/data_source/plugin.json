@@ -1,0 +1,14 @@
+{
+  "name": "data_source",
+  "version": "1.0.0",
+  "description": "行情数据源插件，提供WebSocket实时K线和Tick数据",
+  "author": "Trading Bot Team",
+  "type": "data_source",
+  "entry_point": "market_data.py",
+  "dependencies": [],
+  "config_schema": {
+    "exchange": "binance",
+    "testnet": false,
+    "reconnect_interval": 5
+  }
+}

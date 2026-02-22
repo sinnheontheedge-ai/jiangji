@@ -1,0 +1,390 @@
+"""
+资金监控器 - 定期检查余额并触发盈利提取和自动补足
+"""
+import asyncio
+from typing import Dict, Optional
+from loguru import logger
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
+from core.event_bus import EventBus
+from core.database import get_db, Account, FundConfig
+from plugins.fund_engine.profit_extract import (
+    ProfitExtractionEngine,
+    InitialCapitalProtection,
+    ProfitMultipleEndpoint
+)
+from plugins.fund_engine.auto_replenish import AutoReplenishEngine
+
+
+class FundMonitor:
+    """
+    资金监控器
+    
+    职责：
+    1. 定期检查账户余额
+    2. 触发盈利提取
+    3. 触发初始金额保护
+    4. 触发盈利倍数终点
+    5. 触发自动补足余额
+    """
+    
+    def __init__(self):
+        """初始化资金监控器"""
+        self.event_bus = EventBus.get_instance()
+        self.running = False
+        self.check_interval = 60  # 检查间隔（秒）
+        
+        # 为每个账户存储引擎实例
+        self.profit_extraction_engines: Dict[int, ProfitExtractionEngine] = {}
+        self.capital_protections: Dict[int, InitialCapitalProtection] = {}
+        self.profit_endpoints: Dict[int, ProfitMultipleEndpoint] = {}
+        self.auto_replenish_engines: Dict[int, AutoReplenishEngine] = {}
+        
+        # 为每个账户存储币安客户端
+        self.binance_clients: Dict[int, any] = {}
+        
+        logger.info("✅ 资金监控器初始化完成")
+    
+    async def start(self):
+        """启动资金监控器"""
+        self.running = True
+        logger.info(f"✅ 资金监控器已启动，检查间隔={self.check_interval}秒")
+        
+        # 启动监控循环
+        asyncio.create_task(self._monitor_loop())
+    
+    async def stop(self):
+        """停止资金监控器"""
+        self.running = False
+        logger.info("🛑 资金监控器已停止")
+    
+    async def load_engines_for_account(self, account_id: int, db: AsyncSession):
+        """
+        为指定账户加载所有引擎
+        
+        Args:
+            account_id: 账户ID
+            db: 数据库会话
+        """
+        try:
+            # 查询账户
+            result = await db.execute(select(Account).where(Account.id == account_id))
+            account = result.scalar_one_or_none()
+            if not account:
+                logger.error(f"❌ 账户 {account_id} 不存在")
+                return
+            
+            # 初始化币安客户端
+            if account_id not in self.binance_clients:
+                from core.binance_client import BinanceClient
+                self.binance_clients[account_id] = BinanceClient(
+                    api_key=account.api_key,
+                    api_secret=account.api_secret,
+                    testnet=account.testnet
+                )
+                logger.info(f"✅ 为账户 {account_id} 初始化币安客户端")
+            
+            # 查询资金管理配置
+            result = await db.execute(select(FundConfig).where(FundConfig.account_id == account_id))
+            fund_config = result.scalar_one_or_none()
+            
+            if not fund_config:
+                logger.warning(f"⚠️ 账户 {account_id} 未配置资金管理")
+                return
+            
+            # 初始化盈利提取引擎
+            extraction_config = {
+                "mode": fund_config.extraction_mode,
+                "initial_margin": fund_config.initial_margin
+            }
+            if fund_config.threshold:
+                extraction_config["threshold"] = fund_config.threshold
+            if fund_config.multiple:
+                extraction_config["multiple"] = fund_config.multiple
+            if fund_config.max_extract_ratio:
+                extraction_config["max_extract_ratio"] = fund_config.max_extract_ratio
+            
+            self.profit_extraction_engines[account_id] = ProfitExtractionEngine(extraction_config)
+            logger.info(f"✅ 为账户 {account_id} 初始化盈利提取引擎")
+            
+            # 初始化初始金额保护
+            if fund_config.protection_enabled:
+                protection_config = {
+                    "initial_amount": fund_config.protection_initial_amount,
+                    "protect_multiple": fund_config.protection_multiple,
+                    "max_protect_count": fund_config.protection_max_count,
+                    "transfer_step": fund_config.protection_transfer_step
+                }
+                self.capital_protections[account_id] = InitialCapitalProtection(protection_config)
+                logger.info(f"✅ 为账户 {account_id} 初始化初始金额保护")
+            
+            # 初始化盈利倍数终点
+            if fund_config.endpoint_enabled:
+                endpoint_config = {
+                    "initial_amount": fund_config.endpoint_initial_amount,
+                    "endpoint_multiple": fund_config.endpoint_multiple,
+                    "transfer_step": fund_config.endpoint_transfer_step
+                }
+                self.profit_endpoints[account_id] = ProfitMultipleEndpoint(endpoint_config)
+                logger.info(f"✅ 为账户 {account_id} 初始化盈利倍数终点")
+            
+            # 初始化自动补足余额引擎
+            if fund_config.replenish_enabled:
+                replenish_config = {
+                    "initial_capital": fund_config.replenish_initial_capital,
+                    "check_interval": fund_config.replenish_check_interval,
+                    "min_transfer_amount": fund_config.replenish_min_amount,
+                    "enable_alert": fund_config.replenish_enable_alert,
+                    "alert_threshold": fund_config.replenish_alert_threshold,
+                    "max_replenish_per_day": fund_config.replenish_max_per_day
+                }
+                self.auto_replenish_engines[account_id] = AutoReplenishEngine(replenish_config)
+                logger.info(f"✅ 为账户 {account_id} 初始化自动补足余额引擎")
+            
+        except Exception as e:
+            logger.error(f"❌ 为账户 {account_id} 加载引擎失败: {e}")
+            raise
+    
+    async def _monitor_loop(self):
+        """监控循环"""
+        while self.running:
+            try:
+                await self._check_all_accounts()
+            except Exception as e:
+                logger.error(f"❌ 资金监控检查失败: {e}")
+            
+            # 等待下次检查
+            await asyncio.sleep(self.check_interval)
+    
+    async def _check_all_accounts(self):
+        """检查所有账户"""
+        # 获取数据库会话
+        async for db in get_db():
+            try:
+                # 查询所有账户
+                result = await db.execute(select(Account))
+                accounts = result.scalars().all()
+                
+                for account in accounts:
+                    await self._check_account(account.id, db)
+                
+            finally:
+                await db.close()
+            break
+    
+    async def _check_account(self, account_id: int, db: AsyncSession):
+        """
+        检查单个账户
+        
+        Args:
+            account_id: 账户ID
+            db: 数据库会话
+        """
+        try:
+            # 检查引擎是否已加载
+            if account_id not in self.binance_clients:
+                return
+            
+            # 获取币安客户端
+            client = self.binance_clients[account_id]
+            
+            # 获取账户余额
+            balance_info = await client.get_balance()
+            contract_balance = float(balance_info.get('availableBalance', 0))
+            wallet_balance = float(balance_info.get('totalWalletBalance', 0))
+            
+            logger.debug(f"💰 账户 {account_id} 余额: 合约={contract_balance}, 钱包={wallet_balance}")
+            
+            # 1. 检查盈利提取
+            if account_id in self.profit_extraction_engines:
+                await self._check_profit_extraction(account_id, contract_balance, wallet_balance, client, db)
+            
+            # 2. 检查初始金额保护
+            if account_id in self.capital_protections:
+                await self._check_capital_protection(account_id, contract_balance, client, db)
+            
+            # 3. 检查盈利倍数终点
+            if account_id in self.profit_endpoints:
+                await self._check_profit_endpoint(account_id, contract_balance, client, db)
+            
+            # 4. 检查自动补足余额
+            if account_id in self.auto_replenish_engines:
+                await self._check_auto_replenish(account_id, contract_balance, wallet_balance, client, db)
+            
+        except Exception as e:
+            logger.error(f"❌ 检查账户 {account_id} 失败: {e}")
+    
+    async def _check_profit_extraction(self, account_id: int, contract_balance: float, 
+                                      wallet_balance: float, client: any, db: AsyncSession):
+        """检查盈利提取"""
+        try:
+            engine = self.profit_extraction_engines[account_id]
+            
+            should_extract, extract_amount, message = engine.check_and_calculate(
+                current_balance=contract_balance,
+                wallet_balance=wallet_balance
+            )
+            
+            if should_extract:
+                logger.info(f"💸 触发盈利提取: 账户={account_id}, 金额={extract_amount}, 原因={message}")
+                
+                # 执行划转
+                await client.transfer(
+                    asset="USDT",
+                    amount=extract_amount,
+                    from_account="FUTURES",
+                    to_account="SPOT"
+                )
+                
+                # 更新数据库
+                result = await db.execute(select(FundConfig).where(FundConfig.account_id == account_id))
+                fund_config = result.scalar_one_or_none()
+                if fund_config:
+                    fund_config.total_extracted = (fund_config.total_extracted or 0) + extract_amount
+                    await db.commit()
+                
+                logger.info(f"✅ 盈利提取完成: {extract_amount} USDT")
+                
+                # 发布事件
+                await self.event_bus.publish(
+                    f"fund:profit_extracted:{account_id}",
+                    {
+                        "account_id": account_id,
+                        "amount": extract_amount,
+                        "message": message
+                    }
+                )
+            
+        except Exception as e:
+            logger.error(f"❌ 盈利提取检查失败: {e}")
+    
+    async def _check_capital_protection(self, account_id: int, contract_balance: float, 
+                                       client: any, db: AsyncSession):
+        """检查初始金额保护"""
+        try:
+            protection = self.capital_protections[account_id]
+            
+            should_protect, protect_amount, message = protection.check_and_calculate(contract_balance)
+            
+            if should_protect:
+                logger.info(f"🛡️ 触发初始金额保护: 账户={account_id}, 金额={protect_amount}, 原因={message}")
+                
+                # 执行划转
+                await client.transfer(
+                    asset="USDT",
+                    amount=protect_amount,
+                    from_account="FUTURES",
+                    to_account="SPOT"
+                )
+                
+                # 更新数据库
+                result = await db.execute(select(FundConfig).where(FundConfig.account_id == account_id))
+                fund_config = result.scalar_one_or_none()
+                if fund_config:
+                    fund_config.protection_count = (fund_config.protection_count or 0) + 1
+                    await db.commit()
+                
+                logger.info(f"✅ 初始金额保护完成: {protect_amount} USDT")
+                
+                # 发布事件
+                await self.event_bus.publish(
+                    f"fund:capital_protected:{account_id}",
+                    {
+                        "account_id": account_id,
+                        "amount": protect_amount,
+                        "message": message
+                    }
+                )
+            
+        except Exception as e:
+            logger.error(f"❌ 初始金额保护检查失败: {e}")
+    
+    async def _check_profit_endpoint(self, account_id: int, contract_balance: float, 
+                                    client: any, db: AsyncSession):
+        """检查盈利倍数终点"""
+        try:
+            endpoint = self.profit_endpoints[account_id]
+            
+            should_trigger, transfer_amount, message = endpoint.check_and_calculate(contract_balance)
+            
+            if should_trigger:
+                logger.info(f"🎯 触发盈利倍数终点: 账户={account_id}, 金额={transfer_amount}, 原因={message}")
+                
+                # 执行划转
+                await client.transfer(
+                    asset="USDT",
+                    amount=transfer_amount,
+                    from_account="FUTURES",
+                    to_account="SPOT"
+                )
+                
+                # 更新数据库
+                result = await db.execute(select(FundConfig).where(FundConfig.account_id == account_id))
+                fund_config = result.scalar_one_or_none()
+                if fund_config:
+                    fund_config.endpoint_triggered = True
+                    await db.commit()
+                
+                logger.info(f"✅ 盈利倍数终点完成: {transfer_amount} USDT")
+                
+                # 发布事件（停止所有实例）
+                await self.event_bus.publish(
+                    f"fund:endpoint_triggered:{account_id}",
+                    {
+                        "account_id": account_id,
+                        "amount": transfer_amount,
+                        "message": message
+                    }
+                )
+            
+        except Exception as e:
+            logger.error(f"❌ 盈利倍数终点检查失败: {e}")
+    
+    async def _check_auto_replenish(self, account_id: int, contract_balance: float, 
+                                   wallet_balance: float, client: any, db: AsyncSession):
+        """检查自动补足余额"""
+        try:
+            engine = self.auto_replenish_engines[account_id]
+            
+            need_replenish, replenish_amount, message = engine.check_and_calculate(
+                contract_balance=contract_balance,
+                spot_balance=wallet_balance
+            )
+            
+            if need_replenish:
+                logger.info(f"💵 触发自动补足余额: 账户={account_id}, 金额={replenish_amount}, 原因={message}")
+                
+                # 执行划转
+                await client.transfer(
+                    asset="USDT",
+                    amount=replenish_amount,
+                    from_account="SPOT",
+                    to_account="FUTURES"
+                )
+                
+                # 更新数据库
+                result = await db.execute(select(FundConfig).where(FundConfig.account_id == account_id))
+                fund_config = result.scalar_one_or_none()
+                if fund_config:
+                    fund_config.replenish_count = (fund_config.replenish_count or 0) + 1
+                    await db.commit()
+                
+                logger.info(f"✅ 自动补足余额完成: {replenish_amount} USDT")
+                
+                # 发布事件
+                await self.event_bus.publish(
+                    f"fund:auto_replenished:{account_id}",
+                    {
+                        "account_id": account_id,
+                        "amount": replenish_amount,
+                        "message": message
+                    }
+                )
+            
+        except Exception as e:
+            logger.error(f"❌ 自动补足余额检查失败: {e}")
+
+
+# 全局资金监控器实例
+fund_monitor = FundMonitor()

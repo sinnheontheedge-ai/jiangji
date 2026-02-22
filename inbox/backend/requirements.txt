@@ -1,0 +1,38 @@
+# Web框架
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# 数据库
+sqlalchemy==2.0.25
+asyncpg==0.29.0
+alembic==1.13.1
+aiosqlite==0.19.0
+
+# Redis和异步
+redis==5.0.1
+aioredis==2.0.1
+aiohttp==3.9.1
+websockets==12.0
+
+# 数据处理
+pandas==2.1.4
+numpy==1.26.3
+
+# 工具库
+python-dotenv==1.0.0
+pyyaml==6.0.1
+python-multipart==0.0.6
+
+# 日志和监控
+loguru==0.7.2
+
+# 测试
+pytest==7.4.4
+pytest-asyncio==0.23.3
+httpx==0.26.0
+psycopg2-binary==2.9.9
+
+# 交易所API
+ccxt>=4.0.0

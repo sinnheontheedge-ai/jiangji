@@ -1,0 +1,10 @@
+{
+  "name": "notification_engine",
+  "version": "1.0.0",
+  "description": "通知引擎插件，支持Telegram、Email、Webhook等多种通知方式",
+  "author": "Trading Bot Team",
+  "type": "notification",
+  "entry_point": "notifier.py",
+  "dependencies": [],
+  "config_schema": {}
+}

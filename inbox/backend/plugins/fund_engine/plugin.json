@@ -1,0 +1,10 @@
+{
+  "name": "fund_engine",
+  "version": "1.0.0",
+  "description": "资金管理引擎插件，包含复利、盈利提取、自动补足等功能",
+  "author": "Trading Bot Team",
+  "type": "fund_management",
+  "entry_point": "compounding.py",
+  "dependencies": [],
+  "config_schema": {}
+}

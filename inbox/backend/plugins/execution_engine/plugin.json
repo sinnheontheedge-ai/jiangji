@@ -1,0 +1,10 @@
+{
+  "name": "execution_engine",
+  "version": "1.0.0",
+  "description": "交易执行引擎插件，负责订单执行和管理",
+  "author": "Trading Bot Team",
+  "type": "execution",
+  "entry_point": "trade_executor.py",
+  "dependencies": [],
+  "config_schema": {}
+}

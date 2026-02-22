@@ -1,0 +1,10 @@
+{
+  "name": "risk_engine",
+  "version": "1.0.0",
+  "description": "风控引擎插件，提供止盈止损、移动止损、分档锁盈等功能",
+  "author": "Trading Bot Team",
+  "type": "risk_management",
+  "entry_point": "tpsl_manager.py",
+  "dependencies": [],
+  "config_schema": {}
+}
